@@ -1,0 +1,15 @@
+# dsh-myosotis —— bundle patch
+#
+# 往当前 profile 的配置树里插一行。所有默认值都在 lib/index.js 的 Config 里，
+# 这里不写 config 也能正常启动；要改就照下面注释的写法加 config。
+#
+# - insert:
+#     - id: memory
+#       name: dsh-myosotis
+#       config:
+#         budgetChars: 3000
+#         autoEpisode: true
+
+- insert:
+    - id: memory
+      name: dsh-myosotis

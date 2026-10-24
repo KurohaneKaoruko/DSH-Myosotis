@@ -1,0 +1,14 @@
+# 依赖 / 构建产物
+node_modules/
+.tmp-*/
+*.log
+
+# 本地工程记忆（想提交进仓库就删掉这两行）
+.workbuddy-ai/
+.dsh/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
