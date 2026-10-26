@@ -65,10 +65,11 @@ test('真实运行时：插件能被 Cordis 装载并注册段落与工具', { s
   const previous = process.env.DSH_HOME;
   process.env.DSH_HOME = join(root, 'home');
   const ctx = new Context();
+  let fiber;
   try {
     await ctx.plugin(SystemPrompt);
     await ctx.plugin(ToolRuntime);
-    const fiber = ctx.plugin(plugin, {});
+    fiber = ctx.plugin(plugin, {});
     await fiber;
     assert.equal(fiber.error, undefined, `插件装载失败：${fiber.error?.message}`);
 
@@ -98,7 +99,18 @@ test('真实运行时：插件能被 Cordis 装载并注册段落与工具', { s
     const recall = withAgent.sections.find((section) => section.name === 'memory:recall');
     assert.ok(recall, '有记忆时应出现 memory:recall 段落');
     assert.match(recall.text, /运行时测试/);
+
+    // 深记忆：真运行时里 SQLite 应当可用（DSH 跑 Node 24），不可用则跳过这段。
+    const search = ctx.tools.get('memory_search');
+    if (ctx.tools.get('memory_save') && typeof process.getBuiltinModule === 'function' && process.getBuiltinModule('node:sqlite')) {
+      const archived = await save.execute({ text: '真运行时里写进 SQLite 的一条归档', scope: 'deep', kind: 'episode' }, { agent });
+      assert.equal(archived.scope, 'deep');
+      const found = await search.execute({ query: 'SQLite 归档' }, { agent });
+      assert.ok(found.results.some((hit) => hit.scope === 'deep'), '深记忆应能被检索到');
+    }
   } finally {
+    // 必须先卸载插件（effect 清理里会关掉 SQLite 句柄），否则 Windows 上删不掉临时目录。
+    await fiber?.dispose?.();
     process.env.DSH_HOME = previous;
     await ctx.stop?.();
     rmSync(root, { recursive: true, force: true });

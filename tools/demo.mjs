@@ -32,6 +32,7 @@ try {
   service.save({ text: '这个仓库用 pnpm，不要引入 npm 的 lock 文件', scope: 'project', kind: 'gotcha', importance: 4 }, agent);
   service.save({ text: '2026-10 一起把检索从分作用域 IDF 改成全局 IDF，他发现问题时很兴奋', scope: 'global', kind: 'episode', importance: 3, affect: { label: '兴奋', intensity: 3 }, date: '10-24' }, agent);
   service.save({ text: '这轮在调记忆注入的预算', scope: 'session', kind: 'fact', importance: 2 }, agent);
+  service.save({ text: '2025-03 那次也卡在同样的检索排序上，最后是靠把 IDF 提到整池才算对', scope: 'deep', kind: 'episode', importance: 3 }, agent);
 
   service.noteQuery(agent.id, query);
   const block = service.renderFor(agent);

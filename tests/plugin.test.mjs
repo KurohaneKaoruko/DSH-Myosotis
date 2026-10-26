@@ -14,6 +14,9 @@ import { join } from 'node:path';
 import { DEFAULTS, validateConfig } from '../lib/config.js';
 import { apply } from '../lib/index.js';
 
+/** 本文件创建过的假 ctx；每个用例结束时统一卸载，确保 SQLite 句柄被释放。 */
+const harnesses = [];
+
 /**
  * 造一个最小可用的 Cordis 上下文。
  * @returns {any} 带观测面的假 ctx。
@@ -53,7 +56,7 @@ function createCtx() {
       return undefined;
     },
   };
-  return {
+  const harness = {
     ctx,
     sections,
     tools,
@@ -62,13 +65,16 @@ function createCtx() {
       for (const handler of listeners.get(name) ?? []) handler(payload);
     },
   };
+  harnesses.push(harness);
+  return harness;
 }
 
 /**
- * 隔离 DSH_HOME 的测试环境。
+ * 隔离 DSH_HOME 的测试环境；结束时先卸载插件再删临时目录。
+ * 用 async 是为了等测试体里的 Promise 跑完再清理——否则 SQLite 句柄会在断言前被关掉。
  * @param {(env: any) => any} run 测试体。
  */
-function withEnv(run) {
+async function withEnv(run) {
   const root = mkdtempSync(join(tmpdir(), 'myosotis-plugin-'));
   const previous = process.env.DSH_HOME;
   process.env.DSH_HOME = join(root, 'dsh-home');
@@ -78,15 +84,25 @@ function withEnv(run) {
     session: { header: { id: 'session-1', cwd }, events: [] },
   };
   try {
-    return run({ root, cwd, agent });
+    return await run({ root, cwd, agent });
   } finally {
+    // 假 ctx 不会自己跑 effect 清理，这里手动卸载，否则 Windows 上 db 文件被占用。
+    for (const harness of harnesses.splice(0)) {
+      for (const cleanup of harness.cleanups) {
+        try {
+          cleanup?.();
+        } catch {
+          /* 清理失败不影响断言结果 */
+        }
+      }
+    }
     process.env.DSH_HOME = previous;
     rmSync(root, { recursive: true, force: true });
   }
 }
 
 test('apply：注册两个提示词段落与三个工具', () => {
-  withEnv(() => {
+  return withEnv(() => {
     const harness = createCtx();
     apply(harness.ctx, { ...DEFAULTS });
     assert.deepEqual(
@@ -107,7 +123,7 @@ test('apply：注册两个提示词段落与三个工具', () => {
 });
 
 test('apply：enabled=false 时什么都不注册', () => {
-  withEnv(() => {
+  return withEnv(() => {
     const harness = createCtx();
     apply(harness.ctx, { ...DEFAULTS, enabled: false });
     assert.equal(harness.sections.length, 0);
@@ -116,7 +132,7 @@ test('apply：enabled=false 时什么都不注册', () => {
 });
 
 test('apply：policy=false 时只注册注入段落', () => {
-  withEnv(() => {
+  return withEnv(() => {
     const harness = createCtx();
     apply(harness.ctx, { ...DEFAULTS, policy: false });
     assert.deepEqual(
@@ -127,7 +143,7 @@ test('apply：policy=false 时只注册注入段落', () => {
 });
 
 test('recall 段落：按当前 agent 渲染出已保存的记忆', () => {
-  withEnv(({ agent }) => {
+  return withEnv(({ agent }) => {
     const harness = createCtx();
     apply(harness.ctx, { ...DEFAULTS });
     const save = harness.tools.find((tool) => tool.name === 'memory_save');
@@ -144,7 +160,7 @@ test('recall 段落：按当前 agent 渲染出已保存的记忆', () => {
 });
 
 test('recall 段落：渲染异常时返回空串而不是抛出', () => {
-  withEnv(() => {
+  return withEnv(() => {
     const harness = createCtx();
     apply(harness.ctx, { ...DEFAULTS });
     const recall = harness.sections.find((section) => section.name === 'memory:recall');
@@ -154,7 +170,7 @@ test('recall 段落：渲染异常时返回空串而不是抛出', () => {
 });
 
 test('自动捕获：用户说「以后都用 pnpm」时落一条会话记忆', () => {
-  withEnv(({ agent }) => {
+  return withEnv(({ agent }) => {
     const harness = createCtx();
     apply(harness.ctx, { ...DEFAULTS });
     harness.emit('agent/inbox/claimed', {
@@ -171,7 +187,7 @@ test('自动捕获：用户说「以后都用 pnpm」时落一条会话记忆', 
 });
 
 test('自动捕获：只问「你记得吗」时不记录', () => {
-  withEnv(({ agent }) => {
+  return withEnv(({ agent }) => {
     const harness = createCtx();
     apply(harness.ctx, { ...DEFAULTS });
     harness.emit('agent/inbox/claimed', {
@@ -184,7 +200,7 @@ test('自动捕获：只问「你记得吗」时不记录', () => {
 });
 
 test('工具：save → search → forget 全链路', () => {
-  withEnv(({ agent }) => {
+  return withEnv(({ agent }) => {
     const harness = createCtx();
     apply(harness.ctx, { ...DEFAULTS });
     const save = harness.tools.find((tool) => tool.name === 'memory_save');
@@ -211,8 +227,28 @@ test('工具：save → search → forget 全链路', () => {
   });
 });
 
+test('工具：memory_save 支持 scope=deep，检索能捞回来', () => {
+  return withEnv(({ agent }) => {
+    const harness = createCtx();
+    apply(harness.ctx, { ...DEFAULTS });
+    const save = harness.tools.find((tool) => tool.name === 'memory_save');
+    const search = harness.tools.find((tool) => tool.name === 'memory_search');
+    return save
+      .execute({ text: '2026-10 那次重构把状态机拆成了三个 reducer', scope: 'deep', kind: 'episode' }, { agent })
+      .then((saved) => {
+        assert.equal(saved.scope, 'deep');
+        assert.equal(saved.total, 1);
+        return search.execute({ query: '状态机' }, { agent });
+      })
+      .then((found) => {
+        assert.equal(found.count, 1);
+        assert.equal(found.results[0].scope, 'deep');
+      });
+  });
+});
+
 test('工具：memory_save 缺 text 时抛出可读错误', () => {
-  withEnv(({ agent }) => {
+  return withEnv(({ agent }) => {
     const harness = createCtx();
     apply(harness.ctx, { ...DEFAULTS });
     const save = harness.tools.find((tool) => tool.name === 'memory_save');
@@ -221,7 +257,7 @@ test('工具：memory_save 缺 text 时抛出可读错误', () => {
 });
 
 test('工具：没有 agent 时拒绝执行', () => {
-  withEnv(() => {
+  return withEnv(() => {
     const harness = createCtx();
     apply(harness.ctx, { ...DEFAULTS });
     const search = harness.tools.find((tool) => tool.name === 'memory_search');
@@ -230,7 +266,7 @@ test('工具：没有 agent 时拒绝执行', () => {
 });
 
 test('工具：输出能被各自的 output.render 消费', () => {
-  withEnv(({ agent }) => {
+  return withEnv(({ agent }) => {
     const harness = createCtx();
     apply(harness.ctx, { ...DEFAULTS });
     const save = harness.tools.find((tool) => tool.name === 'memory_save');

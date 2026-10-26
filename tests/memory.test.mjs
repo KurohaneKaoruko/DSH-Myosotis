@@ -176,3 +176,92 @@ test('capture：自动捕获落到会话作用域并带过期时间', () => {
     assert.equal(item.source.auto, true);
   });
 });
+
+// ── 深记忆 ────────────────────────────────────────────────────────────────
+
+test('deep：scope=deep 写进 SQLite 而不是 JSON', () => {
+  withEnv(({ home, agent, service }) => {
+    const result = service.save({ text: '2026-10 把检索从分作用域 IDF 改成全局 IDF', scope: 'deep', kind: 'episode' }, agent);
+    assert.equal(result.scope, 'deep');
+    assert.equal(service.deep.stats().count, 1);
+    assert.ok(existsSync(join(home, 'memory', 'deep.db')));
+    // 精选层不应出现这条
+    assert.equal(service.projectStore(agent.session.header.cwd).list().length, 0);
+  });
+});
+
+test('deep：检索能把深记忆一起捞出来', () => {
+  withEnv(({ agent, service }) => {
+    service.save({ text: '提交信息一律用中文', scope: 'project' }, agent);
+    service.save({ text: '两年前那次重构把状态机拆成了三个 reducer', scope: 'deep', kind: 'episode' }, agent);
+    const results = service.search('状态机 重构', {}, agent);
+    assert.ok(results.some((hit) => hit.scope === 'deep'));
+    assert.ok(results.some((hit) => hit.scope === 'project'));
+  });
+});
+
+test('deep：从深记忆提回精选层', () => {
+  withEnv(({ agent, service }) => {
+    const archived = service.save({ text: '这条其实经常要用', scope: 'deep' }, agent);
+    const promoted = service.save({ id: archived.item.id, scope: 'project' }, agent);
+    assert.equal(promoted.moved, true);
+    assert.equal(promoted.scope, 'project');
+    assert.equal(service.deep.stats().count, 0);
+    assert.equal(service.projectStore(agent.session.header.cwd).list().length, 1);
+  });
+});
+
+test('deep：从精选层沉底到深记忆', () => {
+  withEnv(({ agent, service }) => {
+    const saved = service.save({ text: '这条已经不需要每轮看到了', scope: 'project' }, agent);
+    const demoted = service.save({ id: saved.item.id, scope: 'deep' }, agent);
+    assert.equal(demoted.moved, true);
+    assert.equal(demoted.scope, 'deep');
+    assert.equal(service.projectStore(agent.session.header.cwd).list().length, 0);
+    assert.equal(service.deep.stats().count, 1);
+  });
+});
+
+test('deep：会话记忆过期后沉淀进深记忆', () => {
+  withEnv(({ cwd, agent, service }) => {
+    const store = service.sessionStore('session-abc', cwd);
+    store.add({ text: '这次会话里的临时线索' }, { cwd, sessionId: 'session-abc', scope: 'session', expiresAt: Date.now() - 1000 });
+    store.prune();
+    const archived = service.drainExpired();
+    assert.equal(archived, 1);
+    assert.equal(store.list().length, 0);
+    assert.equal(service.deep.stats().count, 1);
+    assert.equal(service.deep.search('临时线索', { project: '' })[0].text, '这次会话里的临时线索');
+  });
+});
+
+test('deep：相关往事会被注入', () => {
+  withEnv(({ agent, service }) => {
+    service.config.deepRecallMin = 0;
+    service.save({ text: '去年也遇到过这种检索排序的问题，最后靠全局 IDF 解决', scope: 'deep', kind: 'episode' }, agent);
+    service.noteQuery(agent.id, '检索排序为什么不对');
+    const text = service.renderFor(agent);
+    assert.match(text, /相关往事/);
+    assert.match(text, /全局 IDF/);
+  });
+});
+
+test('deep：按 id 删除深记忆', () => {
+  withEnv(({ agent, service }) => {
+    const saved = service.save({ text: '删掉我', scope: 'deep' }, agent);
+    const removed = service.forget({ id: saved.item.id }, agent);
+    assert.equal(removed.removed.length, 1);
+    assert.equal(removed.removed[0].scope, 'deep');
+    assert.equal(service.deep.stats().count, 0);
+  });
+});
+
+test('deep：统计里带上深记忆', () => {
+  withEnv(({ agent, service }) => {
+    service.save({ text: '一条深记忆', scope: 'deep' }, agent);
+    const stats = service.stats(agent);
+    assert.equal(stats.deep, 1);
+    assert.equal(stats.deepEnabled, true);
+    assert.ok(stats.deepBytes >= 0);
+  });
+});

@@ -14,11 +14,11 @@
  * 和插件读写的是同一批文件，所以改完重启 DSH 就会生效（或者下一次组装提示词时生效）。
  * 环境变量 DSH_HOME 与插件一致，默认 `~/.dsh`。
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 import { DEFAULTS } from '../lib/config.js';
-import { MemoryService } from '../lib/memory.js';
+import { MemoryService, projectKey } from '../lib/memory.js';
 import { globalDir, projectDir, sessionFile } from '../lib/paths.js';
 import { KIND_LABELS, KINDS } from '../lib/store.js';
 
@@ -104,21 +104,153 @@ function scopeFilter() {
   return [scope];
 }
 
+/**
+ * 人类可读的字节数。
+ * @param {number} bytes 字节。
+ * @returns {string} 形如 `1.2 MB`。
+ */
+function formatBytes(bytes) {
+  const value = Number(bytes ?? 0);
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/**
+ * 深记忆子命令。
+ * @param {string} sub 子命令名。
+ */
+function deepCommand(sub) {
+  if (!service.deep) {
+    console.error('深记忆不可用：当前 Node 没有 node:sqlite，或配置里 deep 被关掉了。');
+    process.exit(1);
+  }
+  const store = service.deep;
+  const limit = Number(args.limit ?? 20);
+  switch (sub) {
+    case 'list': {
+      const rows = store.exportAll(projectKey(cwd)).sort((a, b) => b.updatedAt - a.updatedAt).slice(0, limit);
+      if (rows.length === 0) {
+        console.log('深记忆还是空的。');
+        break;
+      }
+      table(
+        ['id', '类型', '重要度', '更新时间', '内容'],
+        rows.map((row) => [row.id, KIND_LABELS[row.kind] ?? row.kind, String(row.importance), new Date(row.updatedAt).toISOString().slice(0, 10), row.text]),
+      );
+      break;
+    }
+    case 'search': {
+      const query = args._.slice(2).join(' ');
+      if (!query) {
+        console.error('用法：node tools/memory.mjs deep search <关键词>');
+        process.exit(1);
+      }
+      const rows = store.search(query, { limit, project: projectKey(cwd), touch: false });
+      if (rows.length === 0) {
+        console.log('没有匹配的深记忆。');
+        break;
+      }
+      table(
+        ['id', '类型', '分数', '内容'],
+        rows.map((row) => [row.id, KIND_LABELS[row.kind] ?? row.kind, row.score.toFixed(2), row.text]),
+      );
+      break;
+    }
+    case 'add': {
+      const text = args._.slice(2).join(' ');
+      if (!text) {
+        console.error('用法：node tools/memory.mjs deep add "<内容>" [--kind K] [--importance 1-5]');
+        process.exit(1);
+      }
+      const kind = typeof args.kind === 'string' ? args.kind : 'fact';
+      const result = service.archive({ text, kind, importance: Number(args.importance ?? 3) }, agent);
+      console.log(result ? `已归档 ${result.item.id}（${KIND_LABELS[result.item.kind] ?? result.item.kind}）` : '归档失败。');
+      break;
+    }
+    case 'rm': {
+      const id = args._[2];
+      if (!id) {
+        console.error('用法：node tools/memory.mjs deep rm <id>');
+        process.exit(1);
+      }
+      console.log(store.remove(id) ? `已删除 ${id}` : `没有找到 ${id}`);
+      break;
+    }
+    case 'export': {
+      const file = args._[2];
+      const payload = JSON.stringify({ exportedAt: Date.now(), items: store.exportAll(projectKey(cwd)) }, null, 2);
+      if (file) {
+        writeFileSync(file, payload, 'utf8');
+        console.log(`已导出到 ${file}`);
+      } else {
+        console.log(payload);
+      }
+      break;
+    }
+    case 'import': {
+      const file = args._[2];
+      if (!file) {
+        console.error('用法：node tools/memory.mjs deep import <file.json>');
+        process.exit(1);
+      }
+      const payload = JSON.parse(readFileSync(file, 'utf8'));
+      const items = Array.isArray(payload) ? payload : payload.items;
+      if (!Array.isArray(items)) {
+        console.error('文件里没有 items 数组');
+        process.exit(1);
+      }
+      const count = store.archive(items, { project: projectKey(cwd) });
+      console.log(`导入 ${count} 条。`);
+      break;
+    }
+    case 'vacuum': {
+      const before = store.stats().bytes;
+      store.vacuum();
+      const after = store.stats().bytes;
+      console.log(`已压缩：${formatBytes(before)} → ${formatBytes(after)}`);
+      break;
+    }
+    default: {
+      const stats = store.stats();
+      table(
+        ['项', '值'],
+        [
+          ['条数', String(stats.count)],
+          ['文件大小', formatBytes(stats.bytes)],
+          ['检索方式', stats.fts ? 'FTS5' : 'LIKE（FTS 不可用）'],
+          ['最早', stats.oldest ? new Date(stats.oldest).toISOString().slice(0, 10) : '—'],
+          ['最近', stats.newest ? new Date(stats.newest).toISOString().slice(0, 10) : '—'],
+          ['文件', store.file],
+        ],
+      );
+      console.log('\n子命令：list | search <词> | add "<内容>" | rm <id> | export [file] | import <file> | vacuum');
+    }
+  }
+}
+
 try {
   switch (command) {
     case 'stats': {
       const stats = service.stats(agent);
       table(
-        ['作用域', '条数'],
+        ['层', '条数'],
         [
           ['global', String(stats.global)],
           ['project', String(stats.project)],
           ['session', String(stats.session)],
+          ['deep', stats.deepEnabled ? String(stats.deep) : '（不可用）'],
           ['置顶', String(stats.pinned)],
         ],
       );
       console.log('');
       console.log(`记忆根目录：${stats.root}`);
+      if (stats.deepEnabled) console.log(`深记忆库：  ${stats.deepFile}（${formatBytes(stats.deepBytes)}${stats.deepFts ? '，FTS5' : '，LIKE 检索'}）`);
+      break;
+    }
+
+    case 'deep': {
+      deepCommand(args._[1] ?? 'stats');
       break;
     }
 
@@ -250,17 +382,19 @@ try {
     default: {
       console.log(`dsh-myosotis CLI
 
-  stats                              统计
+  stats                              统计（含深记忆）
   list [--scope S]                   列出
-  search <关键词> [--limit N]        检索
+  search <关键词> [--limit N]        检索（含深记忆）
   add "<内容>" [--scope S] [--kind K] [--importance 1-5] [--tags a,b] [--pin]
   rm <id>                            删除
   pin <id> [--off]                   置顶 / 取消
   export [--scope S]                 导出 JSON
   import <file.json> [--scope S]     导入 JSON
   path                               显示文件位置
+  deep [list|search|add|rm|export|import|vacuum|stats]
+                                     SQLite 深记忆维护
 
-作用域：global / project / session（默认 project；search/list 默认全部）
+作用域：global / project / session / deep（默认 project；search/list 默认全部）
 当前工作目录：${cwd}
 `);
     }
