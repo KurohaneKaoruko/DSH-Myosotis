@@ -21,31 +21,7 @@ import { DEFAULTS } from '../lib/config.js';
 import { MemoryService, projectKey } from '../lib/memory.js';
 import { globalDir, projectDir, sessionFile } from '../lib/paths.js';
 import { KIND_LABELS, KINDS } from '../lib/store.js';
-
-/**
- * 解析 `--key value` / `--flag` 形式的参数。
- * @param {string[]} argv 原始参数。
- * @returns {{ _: string[], [key: string]: any }} 解析结果。
- */
-function parseArgs(argv) {
-  const out = { _: [] };
-  for (let i = 0; i < argv.length; i += 1) {
-    const token = argv[i];
-    if (!token.startsWith('--')) {
-      out._.push(token);
-      continue;
-    }
-    const key = token.slice(2);
-    const next = argv[i + 1];
-    if (next === undefined || next.startsWith('--')) {
-      out[key] = true;
-      continue;
-    }
-    out[key] = next;
-    i += 1;
-  }
-  return out;
-}
+import { formatBytes, parseArgs, table } from './format.mjs';
 
 /**
  * 造一个假的 agent，让 MemoryService 能在 CLI 里复用。
@@ -55,32 +31,6 @@ function parseArgs(argv) {
  */
 function fakeAgent(cwd, sessionId) {
   return { id: sessionId, session: { header: { id: sessionId, cwd }, events: [] } };
-}
-
-/**
- * 终端显示宽度：CJK 与全角字符占两列。
- * @param {string} text 文本。
- * @returns {number} 列数。
- */
-function displayWidth(text) {
-  let width = 0;
-  for (const char of String(text ?? '')) {
-    width += /[\u1100-\u115f\u2e80-\ua4cf\ua960-\ua97f\uac00-\ud7a3\uf900-\ufaff\ufe10-\ufe19\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6]/u.test(char) ? 2 : 1;
-  }
-  return width;
-}
-
-/**
- * 打印一张表（按显示宽度对齐，中文不会错位）。
- * @param {string[]} headers 表头。
- * @param {string[][]} rows 行。
- */
-function table(headers, rows) {
-  const widths = headers.map((header, index) => Math.max(displayWidth(header), ...rows.map((row) => displayWidth(row[index]))));
-  const line = (cells) => cells.map((cell, index) => String(cell ?? '') + ' '.repeat(Math.max(0, widths[index] - displayWidth(cell)))).join('  ');
-  console.log(line(headers));
-  console.log(widths.map((width) => '─'.repeat(width)).join('  '));
-  for (const row of rows) console.log(line(row));
 }
 
 const args = parseArgs(process.argv.slice(2));
@@ -102,18 +52,6 @@ function scopeFilter() {
     process.exit(1);
   }
   return [scope];
-}
-
-/**
- * 人类可读的字节数。
- * @param {number} bytes 字节。
- * @returns {string} 形如 `1.2 MB`。
- */
-function formatBytes(bytes) {
-  const value = Number(bytes ?? 0);
-  if (value < 1024) return `${value} B`;
-  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
-  return `${(value / 1024 / 1024).toFixed(1)} MB`;
 }
 
 /**
@@ -241,6 +179,9 @@ try {
           ['session', String(stats.session)],
           ['deep', stats.deepEnabled ? String(stats.deep) : '（不可用）'],
           ['置顶', String(stats.pinned)],
+          ['打法', String(stats.playbooks)],
+          ['待复核', String(stats.suspect)],
+          ['被确认过', String(stats.confirmed)],
         ],
       );
       console.log('');
@@ -379,6 +320,40 @@ try {
       break;
     }
 
+    case 'review': {
+      const report = service.review(agent);
+      const { growth } = report;
+      console.log(`现有 ${growth.total} 条；7 天内新增 ${growth.added7d} 条（经验类 ${growth.learned7d} 条），打法 ${growth.playbooks} 条，被确认过 ${growth.confirmed} 条。`);
+
+      if (report.suspect.length > 0) {
+        console.log('\n## 被纠正过');
+        table(['id', '作用域', '类型', '纠正', '确认', '内容'], report.suspect.map((item) => [item.id, item.scope, KIND_LABELS[item.kind] ?? item.kind, String(item.corrections), String(item.confirmed), item.text]));
+      }
+      if (report.conflicts.length > 0) {
+        console.log('\n## 可能矛盾');
+        for (const pair of report.conflicts) console.log(`- ${pair.a.text}\n  与 ${pair.b.text}`);
+      }
+      if (report.duplicates.length > 0) {
+        console.log('\n## 几乎重复');
+        for (const pair of report.duplicates) console.log(`- ${pair.a.text}（${pair.a.id}）\n  ≈ ${pair.b.text}（${pair.b.id}）`);
+      }
+      if (report.stale.length > 0) {
+        console.log('\n## 长期没用');
+        table(['id', '作用域', '类型', '闲置天数', '内容'], report.stale.map((item) => [item.id, item.scope, KIND_LABELS[item.kind] ?? item.kind, String(item.days), item.text]));
+      }
+      if (report.suspect.length + report.conflicts.length + report.duplicates.length + report.stale.length === 0) {
+        console.log('\n没有需要处理的条目。');
+      }
+      break;
+    }
+
+    case 'maintain': {
+      const summary = service.consolidate(agent, { aggressive: Boolean(args.aggressive), dryRun: Boolean(args['dry-run']) });
+      const suffix = args['dry-run'] ? '（试运行，未写入）' : '';
+      console.log(`升权 ${summary.promoted} 条，合并 ${summary.merged} 条，沉底 ${summary.archived} 条${suffix}`);
+      break;
+    }
+
     default: {
       console.log(`dsh-myosotis CLI
 
@@ -388,6 +363,9 @@ try {
   add "<内容>" [--scope S] [--kind K] [--importance 1-5] [--tags a,b] [--pin]
   rm <id>                            删除
   pin <id> [--off]                   置顶 / 取消
+  review                             复盘：被纠正 / 过时 / 重复 / 矛盾
+  maintain [--aggressive] [--dry-run]
+                                     整理：升权常用、合并重复、可选沉底
   export [--scope S]                 导出 JSON
   import <file.json> [--scope S]     导入 JSON
   path                               显示文件位置

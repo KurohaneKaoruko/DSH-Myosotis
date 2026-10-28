@@ -10,7 +10,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -77,9 +77,10 @@ test('真实运行时：插件能被 Cordis 装载并注册段落与工具', { s
     const names = assembly.sections.map((section) => section.name);
     assert.ok(names.includes('memory:policy'));
     assert.ok(names.includes('memory:recall'));
+    assert.ok(names.includes('knowledge:recall'));
     assert.deepEqual(
       assembly.tools.map((tool) => tool.name).sort(),
-      ['memory_forget', 'memory_save', 'memory_search'],
+      ['kb_add', 'kb_remove', 'kb_search', 'memory_forget', 'memory_review', 'memory_save', 'memory_search'],
     );
 
     // 真实注册表拿到的工具，能执行、能渲染。
@@ -100,6 +101,12 @@ test('真实运行时：插件能被 Cordis 装载并注册段落与工具', { s
     assert.ok(recall, '有记忆时应出现 memory:recall 段落');
     assert.match(recall.text, /运行时测试/);
 
+    // 复盘工具：只读，但在真注册表里要能通过 output.schema 校验。
+    const review = ctx.tools.get('memory_review');
+    const report = await review.execute({}, { agent });
+    assert.equal(typeof report.growth.total, 'number');
+    assert.match(review.output.render({}, report)[0].text, /记忆复盘/);
+
     // 深记忆：真运行时里 SQLite 应当可用（DSH 跑 Node 24），不可用则跳过这段。
     const search = ctx.tools.get('memory_search');
     if (ctx.tools.get('memory_save') && typeof process.getBuiltinModule === 'function' && process.getBuiltinModule('node:sqlite')) {
@@ -107,6 +114,16 @@ test('真实运行时：插件能被 Cordis 装载并注册段落与工具', { s
       assert.equal(archived.scope, 'deep');
       const found = await search.execute({ query: 'SQLite 归档' }, { agent });
       assert.ok(found.results.some((hit) => hit.scope === 'deep'), '深记忆应能被检索到');
+
+      // 知识库：真注册表会校验 output.schema，字段少一个就在这里炸。
+      const docs = join(agent.session.header.cwd, 'docs');
+      mkdirSync(docs, { recursive: true });
+      writeFileSync(join(docs, 'note.md'), '# 运行时\n\n## 切块\n\nMarkdown 按标题切块。\n', 'utf8');
+      const added = await ctx.tools.get('kb_add').execute({ path: 'docs' }, { agent });
+      assert.equal(added.added, 1);
+      const hits = await ctx.tools.get('kb_search').execute({ query: '按标题切块' }, { agent });
+      assert.equal(hits.count, 1);
+      assert.equal(hits.results[0].heading, '切块');
     }
   } finally {
     // 必须先卸载插件（effect 清理里会关掉 SQLite 句柄），否则 Windows 上删不掉临时目录。

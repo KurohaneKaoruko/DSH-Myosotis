@@ -7,7 +7,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -101,24 +101,39 @@ async function withEnv(run) {
   }
 }
 
-test('apply：注册两个提示词段落与三个工具', () => {
+test('apply：注册三个提示词段落与六个工具', () => {
   return withEnv(() => {
     const harness = createCtx();
     apply(harness.ctx, { ...DEFAULTS });
     assert.deepEqual(
       harness.sections.map((section) => section.name),
-      ['memory:policy', 'memory:recall'],
+      ['memory:policy', 'memory:recall', 'knowledge:recall'],
     );
-    assert.deepEqual(harness.sections.map((section) => section.order), [30, 31]);
+    assert.deepEqual(harness.sections.map((section) => section.order), [30, 31, 32]);
     assert.deepEqual(
       harness.tools.map((tool) => tool.name),
-      ['memory_save', 'memory_search', 'memory_forget'],
+      ['memory_save', 'memory_search', 'memory_forget', 'memory_review', 'kb_add', 'kb_search', 'kb_remove'],
     );
     for (const tool of harness.tools) {
       assert.equal(tool.parameters.type, 'object');
       assert.equal(typeof tool.output.render, 'function');
       assert.equal(typeof tool.execute, 'function');
     }
+  });
+});
+
+test('apply：knowledge=false 时不注册知识库段落与工具', () => {
+  return withEnv(() => {
+    const harness = createCtx();
+    apply(harness.ctx, { ...DEFAULTS, knowledge: false });
+    assert.deepEqual(
+      harness.sections.map((section) => section.name),
+      ['memory:policy', 'memory:recall'],
+    );
+    assert.deepEqual(
+      harness.tools.map((tool) => tool.name),
+      ['memory_save', 'memory_search', 'memory_forget', 'memory_review'],
+    );
   });
 });
 
@@ -137,7 +152,7 @@ test('apply：policy=false 时只注册注入段落', () => {
     apply(harness.ctx, { ...DEFAULTS, policy: false });
     assert.deepEqual(
       harness.sections.map((section) => section.name),
-      ['memory:recall'],
+      ['memory:recall', 'knowledge:recall'],
     );
   });
 });
@@ -275,6 +290,160 @@ test('工具：输出能被各自的 output.render 消费', () => {
       assert.equal(blocks[0].type, 'text');
       assert.match(blocks[0].text, /pnpm/);
     });
+  });
+});
+
+test('工具：kb_add → kb_search 全链路，结果带文件与行号', () => {
+  return withEnv(({ cwd, agent }) => {
+    const harness = createCtx();
+    apply(harness.ctx, { ...DEFAULTS });
+    const docs = join(cwd, 'docs');
+    mkdirSync(docs, { recursive: true });
+    writeFileSync(join(docs, 'design.md'), '# 设计\n\n## 切块\n\nMarkdown 按标题切块，代码按声明切块。\n', 'utf8');
+
+    const add = harness.tools.find((tool) => tool.name === 'kb_add');
+    const search = harness.tools.find((tool) => tool.name === 'kb_search');
+    return add
+      .execute({ path: 'docs' }, { agent })
+      .then((summary) => {
+        assert.equal(summary.ok, true);
+        assert.equal(summary.added, 1);
+        assert.equal(summary.chunks, 2);
+        assert.equal(summary.documents[0].rel, 'docs/design.md');
+        return search.execute({ query: '按标题切块' }, { agent });
+      })
+      .then((found) => {
+        assert.equal(found.count, 1);
+        assert.equal(found.results[0].heading, '切块');
+        assert.equal(found.results[0].rel, 'docs/design.md');
+        assert.ok(found.results[0].startLine >= 3);
+        assert.match(found.results[0].text, /按标题切块/);
+      });
+  });
+});
+
+test('工具：kb_search 空查询时列出已索引文档', () => {
+  return withEnv(({ cwd, agent }) => {
+    const harness = createCtx();
+    apply(harness.ctx, { ...DEFAULTS });
+    mkdirSync(join(cwd, 'docs'), { recursive: true });
+    writeFileSync(join(cwd, 'docs', 'a.md'), '# 甲\n\n正文。\n', 'utf8');
+
+    const add = harness.tools.find((tool) => tool.name === 'kb_add');
+    const search = harness.tools.find((tool) => tool.name === 'kb_search');
+    return add
+      .execute({ path: 'docs' }, { agent })
+      .then(() => search.execute({}, { agent }))
+      .then((listed) => {
+        assert.equal(listed.count, 0);
+        assert.equal(listed.documents.length, 1);
+        assert.equal(listed.documents[0].title, '甲');
+      });
+  });
+});
+
+test('工具：kb_add 路径不存在时抛出可读错误', () => {
+  return withEnv(({ agent }) => {
+    const harness = createCtx();
+    apply(harness.ctx, { ...DEFAULTS });
+    const add = harness.tools.find((tool) => tool.name === 'kb_add');
+    return assert.rejects(() => add.execute({ path: 'not-there' }, { agent }), /路径不存在/);
+  });
+});
+
+test('工具：kb_remove 按 id 删除，检索不到', () => {
+  return withEnv(({ cwd, agent }) => {
+    const harness = createCtx();
+    apply(harness.ctx, { ...DEFAULTS });
+    mkdirSync(join(cwd, 'docs'), { recursive: true });
+    writeFileSync(join(cwd, 'docs', 'a.md'), '# 甲\n\n要删掉的部署说明。\n', 'utf8');
+
+    const add = harness.tools.find((tool) => tool.name === 'kb_add');
+    const search = harness.tools.find((tool) => tool.name === 'kb_search');
+    const remove = harness.tools.find((tool) => tool.name === 'kb_remove');
+    return add
+      .execute({ path: 'docs' }, { agent })
+      .then((summary) => remove.execute({ id: summary.documents[0].id }, { agent }))
+      .then((removed) => {
+        assert.equal(removed.count, 1);
+        assert.equal(removed.needConfirm, false);
+        return search.execute({ query: '部署' }, { agent });
+      })
+      .then((after) => assert.equal(after.count, 0));
+  });
+});
+
+test('工具：memory_review 返回复盘结构，render 能消费', () => {
+  return withEnv(({ agent }) => {
+    const harness = createCtx();
+    apply(harness.ctx, { ...DEFAULTS });
+    const save = harness.tools.find((tool) => tool.name === 'memory_save');
+    const review = harness.tools.find((tool) => tool.name === 'memory_review');
+    return save
+      .execute({ text: '提交信息一律用中文', scope: 'project', kind: 'convention' }, { agent })
+      .then(() => review.execute({}, { agent }))
+      .then((value) => {
+        assert.equal(value.growth.total, 1);
+        assert.deepEqual(value.suspect, []);
+        assert.deepEqual(value.duplicates, []);
+        const blocks = review.output.render({}, value);
+        assert.equal(blocks[0].type, 'text');
+        assert.match(blocks[0].text, /记忆复盘/);
+      });
+  });
+});
+
+test('学习：用户说「不对」后，复盘里出现可疑条目', () => {
+  return withEnv(({ agent }) => {
+    const harness = createCtx();
+    apply(harness.ctx, { ...DEFAULTS });
+    const save = harness.tools.find((tool) => tool.name === 'memory_save');
+    const review = harness.tools.find((tool) => tool.name === 'memory_review');
+    const recall = harness.sections.find((section) => section.name === 'memory:recall');
+
+    return save
+      .execute({ text: '提交信息一律用英文', scope: 'project', kind: 'convention', importance: 4 }, { agent })
+      .then(() => {
+        // 先渲染一次注入，服务才知道「这一轮给了模型什么」。
+        recall.text({ agent });
+        harness.emit('agent/inbox/claimed', {
+          agent,
+          message: { content: [{ type: 'text', text: '不对，提交信息要用中文' }], source: { kind: 'user' } },
+        });
+        return review.execute({}, { agent });
+      })
+      .then((value) => {
+        assert.equal(value.suspect.length, 1);
+        assert.equal(value.suspect[0].corrections, 1);
+        const blocks = review.output.render({}, value);
+        assert.match(blocks[0].text, /被纠正过/);
+      });
+  });
+});
+
+test('知识库段落：按当前输入注入摘录，带出处', () => {
+  return withEnv(({ cwd, agent }) => {
+    const harness = createCtx();
+    apply(harness.ctx, { ...DEFAULTS });
+    mkdirSync(join(cwd, 'docs'), { recursive: true });
+    writeFileSync(join(cwd, 'docs', 'faq.md'), '# 常见问题\n\n## 为什么不用向量检索\n\n注入在请求组装路径上，不能发网络请求。\n', 'utf8');
+
+    const add = harness.tools.find((tool) => tool.name === 'kb_add');
+    return add
+      .execute({ path: 'docs' }, { agent })
+      .then(() => {
+        harness.emit('agent/inbox/claimed', {
+          agent,
+          message: { content: [{ type: 'text', text: '为什么不用向量检索？' }], source: { kind: 'user' } },
+        });
+        const recall = harness.sections.find((section) => section.name === 'knowledge:recall');
+        const text = recall.text({ agent });
+        assert.match(text, /知识库摘录/);
+        assert.match(text, /docs\/faq\.md/);
+        assert.match(text, /为什么不用向量检索/);
+        // 没有 agent 的组装必须安全降级。
+        assert.equal(recall.text({}), '');
+      });
   });
 });
 

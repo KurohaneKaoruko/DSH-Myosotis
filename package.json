@@ -1,14 +1,18 @@
 {
   "name": "dsh-myosotis",
-  "version": "0.1.0",
-  "description": "DSH 的三层持久记忆插件：全局 / 项目 / 会话，自动注入 + 工具维护 + 情感记忆",
+  "version": "0.3.0",
+  "description": "DSH 的四层持久记忆 + 全文知识库 + 学习闭环：全局 / 项目 / 会话 / 深记忆，SQLite 文档索引，从纠错里修正权重，复盘过时与矛盾的记忆",
   "keywords": [
     "dsh",
     "dsh-plugin",
     "deepseek-harness",
     "memory",
     "long-term-memory",
-    "context"
+    "context",
+    "knowledge-base",
+    "full-text-search",
+    "self-improving",
+    "sqlite"
   ],
   "type": "module",
   "main": "lib/index.js",
